@@ -11,6 +11,13 @@ MAX_CANDIDATES = 5
 # At most 5 candidates on each of at most 4 patches.
 MAX_SEARCH_NODES = MAX_CANDIDATES**MAX_PATCHES
 
+# Limits for the training-label endpoint (POST /v1/training-labels).
+MAX_LABEL_MASKS = 12
+MAX_LABEL_SIDE = 512
+LABEL_STRIDES = (4, 8, 16)
+LABEL_OFFSET_BOUND_MIN = 0.5
+LABEL_OFFSET_BOUND_MAX = 2.0
+
 # Every pasted product instance must keep at least half of its original mask
 # area after clipping and occlusion ("每个实例都须保留原掩码面积的至少一半").
 MIN_VISIBLE_NUMERATOR = 1

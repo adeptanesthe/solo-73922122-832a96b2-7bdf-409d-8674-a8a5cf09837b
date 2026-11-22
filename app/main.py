@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import logging
 
+import numpy as np
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from . import geometry
-from .config import MAX_REQUEST_BYTES
+from . import geometry, grid_labels
+from .config import MAX_LABEL_SIDE, MAX_REQUEST_BYTES
 from .errors import InvalidInput
 from .schemas import (
     BaseInstanceSummary,
@@ -17,6 +18,10 @@ from .schemas import (
     ComposeResponse,
     InfeasibleResponse,
     InstanceResult,
+    LabelAssignment,
+    LabelConflictResponse,
+    TrainingLabelRequest,
+    TrainingLabelResponse,
 )
 
 logger = logging.getLogger("shelf_compositor")
@@ -204,4 +209,87 @@ def compose(payload: ComposeRequest):
         base_instances=base_instances,
         overlapped_base_pixels=solution.overlapped_base_pixels,
         evaluated_combinations=solution.evaluated_combinations,
+    )
+
+
+@app.post(
+    "/v1/training-labels",
+    response_model=TrainingLabelResponse,
+    summary="Assign one feature-grid cell to each masked product",
+    responses={
+        200: {
+            "description": (
+                "Either a feasible one-product-per-cell assignment, or a "
+                "{'status': 'conflict'} Hall-witness report listing products whose "
+                "combined candidate cells are fewer than the products."
+            )
+        },
+        413: {"description": "Request body above the configured limit."},
+        422: {"description": "Malformed or inconsistent input."},
+    },
+)
+def training_labels(payload: TrainingLabelRequest):
+    """Generate per-product grid-cell labels from foreground masks.
+
+    Like ``/v1/compose``, the conflict branch returns a different shape (the
+    witness indices and cell count, no assignments) via a plain JSONResponse
+    rather than the declared response model.
+    """
+
+    decoded_masks: list = []
+    size: tuple[int, int] | None = None
+    for index, mask_b64 in enumerate(payload.masks_b64):
+        label = f"masks_b64[{index}]"
+        image = geometry.decode_b64_image(label, mask_b64)
+        width, height = image.size
+        if width > MAX_LABEL_SIDE or height > MAX_LABEL_SIDE:
+            raise InvalidInput(
+                f"{label}: mask is {width}x{height}; each side must be at most "
+                f"{MAX_LABEL_SIDE} pixels"
+            )
+        if size is None:
+            size = (width, height)
+        elif image.size != size:
+            raise InvalidInput(
+                f"{label}: mask is {width}x{height} but earlier masks are "
+                f"{size[0]}x{size[1]}; all masks must share one size"
+            )
+        mask = geometry._mask_array(image)
+        if not mask.any():
+            raise InvalidInput(f"{label}: mask contains no pixels")
+        decoded_masks.append(np.ascontiguousarray(mask))
+
+    try:
+        result = grid_labels.solve_labels(
+            decoded_masks, payload.stride, payload.offset_bound
+        )
+    except ValueError as exc:
+        # Defensive: solve_labels validates shape/emptiness again for callers
+        # that bypass the API.
+        raise InvalidInput(str(exc)) from exc
+
+    grid_size = [result.grid_width, result.grid_height]
+    if not result.feasible:
+        # The wire conflict response carries only the witness product indices
+        # and their distinct-cell count, per the API contract.
+        return JSONResponse(
+            status_code=200,
+            content=LabelConflictResponse(
+                conflict_mask_indices=list(result.conflict_mask_indices),
+                available_cell_count=result.conflict_cell_count,
+            ).model_dump(),
+        )
+
+    assignments = [
+        LabelAssignment(
+            mask_index=item.mask_index,
+            cell=[item.cell.gx, item.cell.gy],
+            offset=[item.offset_x, item.offset_y],
+        )
+        for item in result.assignments
+    ]
+    return TrainingLabelResponse(
+        stride=result.stride,
+        grid_size=grid_size,
+        assignments=assignments,
     )
